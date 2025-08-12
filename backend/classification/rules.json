@@ -1,0 +1,80 @@
+[
+  {
+    "pattern": "ESKOM|CITY OF|MUNICIPAL|WATER|ELECTRIC",
+    "category": "Utilities",
+    "subcategory": "Electricity/Water",
+    "confidence": 0.9
+  },
+  {
+    "pattern": "ENGEN|SHELL|TOTAL|BP|CALTEX",
+    "category": "Fuel",
+    "subcategory": "Fuel",
+    "confidence": 0.9
+  },
+  {
+    "pattern": "VODACOM|MTN|TELKOM|RAIN|AFRIHOST",
+    "category": "Telecom",
+    "subcategory": "Internet/Mobile",
+    "confidence": 0.9
+  },
+  {
+    "pattern": "PICK N PAY|CHECKERS|SHOPRITE|WOOLWORTHS|SPAR",
+    "category": "Retail",
+    "subcategory": "Groceries",
+    "confidence": 0.7
+  },
+  {
+    "pattern": "UBER|MR D|BOLT|TAKEALOT",
+    "category": "Delivery/Platforms",
+    "subcategory": "Services",
+    "confidence": 0.7
+  },
+  {
+    "pattern": "SERVICE FEE|BANK CHARGES|MONTHLY FEE",
+    "category": "Banking",
+    "subcategory": "Bank Fees",
+    "confidence": 0.95
+  },
+  {
+    "pattern": "INTEREST|OD FEE|OVERDRAFT",
+    "category": "Banking",
+    "subcategory": "Interest/Overdraft",
+    "confidence": 0.95
+  },
+  {
+    "pattern": "SARS|VAT|PAYE",
+    "category": "Tax",
+    "subcategory": "Tax Payments",
+    "confidence": 0.95
+  },
+  {
+    "pattern": "SALARY|PAYROLL|NET PAY|WAGES",
+    "category": "Payroll",
+    "subcategory": "Salaries",
+    "confidence": 0.95
+  },
+  {
+    "pattern": "RENT|LEASE|PROPERTY MANAGEMENT",
+    "category": "Premises",
+    "subcategory": "Rent",
+    "confidence": 0.9
+  },
+  {
+    "pattern": "OUTSURANCE|HOLLARD|SANTAM|DISCOVERY",
+    "category": "Insurance",
+    "subcategory": "Premiums",
+    "confidence": 0.9
+  },
+  {
+    "pattern": "LOAN REPAYMENT|CAPITAL REDUCTION|INSTALMENT",
+    "category": "Finance",
+    "subcategory": "Loan Payments",
+    "confidence": 0.9
+  },
+  {
+    "pattern": "EFT FROM|DEPOSIT|INCOMING|CREDIT",
+    "category": "Income",
+    "subcategory": "Sales/Receipts",
+    "confidence": 0.6
+  }
+]

@@ -1,0 +1,84 @@
+{
+  "Income": {
+    "Sales/Receipts": {
+      "code": "4000",
+      "side": "C"
+    }
+  },
+  "Retail": {
+    "Groceries": {
+      "code": "5200",
+      "side": "D"
+    }
+  },
+  "Utilities": {
+    "Electricity/Water": {
+      "code": "5300",
+      "side": "D"
+    }
+  },
+  "Telecom": {
+    "Internet/Mobile": {
+      "code": "5310",
+      "side": "D"
+    }
+  },
+  "Fuel": {
+    "Fuel": {
+      "code": "5400",
+      "side": "D"
+    }
+  },
+  "Delivery/Platforms": {
+    "Services": {
+      "code": "5450",
+      "side": "D"
+    }
+  },
+  "Banking": {
+    "Bank Fees": {
+      "code": "5600",
+      "side": "D"
+    },
+    "Interest/Overdraft": {
+      "code": "5610",
+      "side": "D"
+    }
+  },
+  "Tax": {
+    "Tax Payments": {
+      "code": "5700",
+      "side": "D"
+    }
+  },
+  "Payroll": {
+    "Salaries": {
+      "code": "5800",
+      "side": "D"
+    }
+  },
+  "Premises": {
+    "Rent": {
+      "code": "5900",
+      "side": "D"
+    }
+  },
+  "Insurance": {
+    "Premiums": {
+      "code": "6000",
+      "side": "D"
+    }
+  },
+  "Finance": {
+    "Loan Payments": {
+      "code": "6100",
+      "side": "D"
+    }
+  },
+  "Uncategorized": {
+    "Uncategorized": {
+      "code": "9999",
+      "side": "D"
+    }
+  }
+}
