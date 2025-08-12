@@ -1,0 +1,853 @@
+diff --git a/README.md b/README.md
+new file mode 100644
+index 0000000..2d0d334
+--- /dev/null
++++ b/README.md
+@@ -0,0 +1,18 @@
++# TheAccountant — Free-Tier Online Deployment Patch
++
++This adds a full **frontend + backend** to run on **Vercel (free)** + **Render (free)** with **Supabase Storage** (free).
++
++## Deploy steps
++- Create Supabase project, bucket `reports` (private). Grab `SUPABASE_URL`, `SUPABASE_ANON_KEY`, `SUPABASE_SERVICE_ROLE_KEY`.
++- Deploy `backend/` on Render:
++  - Build: `pip install -r requirements.txt`
++  - Start: `uvicorn api.main:app --host 0.0.0.0 --port 8000`
++  - ENV: `APP_ENV=production`, `FRONTEND_ORIGIN=https://<vercel-app>`, `SUPABASE_URL=...`, `SUPABASE_SERVICE_ROLE_KEY=...`, `MAX_FILE_MB=25`
++- Deploy `frontend/` on Vercel:
++  - ENV: `NEXT_PUBLIC_SUPABASE_URL`, `NEXT_PUBLIC_SUPABASE_ANON_KEY`, `NEXT_PUBLIC_BACKEND_URL=https://<render-backend>`
++- Open Vercel app, upload CSV/PDF, download artifacts.
++
++## Notes
++- Processing is in-memory; artifacts are uploaded to Supabase and returned as **signed URLs**.
++- PDF OCR via Tesseract is included in the backend image.
++- Extend vendor rules in `backend/classification/rules.json`.
+
+diff --git a/backend/requirements.txt b/backend/requirements.txt
+new file mode 100644
+index 0000000..b469c0a
+--- /dev/null
++++ b/backend/requirements.txt
+@@ -0,0 +1,14 @@
++fastapi==0.111.0
++uvicorn==0.30.1
++pandas==2.2.2
++numpy==1.26.4
++pdfplumber==0.11.0
++pytesseract==0.3.10
++Pillow==10.4.0
++PyMuPDF==1.24.10
++xlsxwriter==3.2.0
++reportlab==4.2.2
++python-multipart==0.0.9
++pydantic==2.7.3
++jinja2==3.1.4
++supabase==2.6.0
+
+diff --git a/backend/Dockerfile b/backend/Dockerfile
+new file mode 100644
+index 0000000..51e9ccb
+--- /dev/null
++++ b/backend/Dockerfile
+@@ -0,0 +1,14 @@
++FROM python:3.11-slim
++
++RUN apt-get update && apt-get install -y --no-install-recommends \
++    tesseract-ocr libtesseract-dev poppler-utils \
++    && rm -rf /var/lib/apt/lists/*
++
++WORKDIR /app
++COPY requirements.txt ./
++RUN pip install --no-cache-dir -r requirements.txt
++
++COPY . .
++ENV PYTHONUNBUFFERED=1
++EXPOSE 8000
++CMD ["uvicorn", "api.main:app", "--host", "0.0.0.0", "--port", "8000"]
+
+diff --git a/backend/api/main.py b/backend/api/main.py
+new file mode 100644
+index 0000000..67bace7
+--- /dev/null
++++ b/backend/api/main.py
+@@ -0,0 +1,63 @@
++import os, uuid, io
++from fastapi import FastAPI, UploadFile, File, HTTPException
++from fastapi.middleware.cors import CORSMiddleware
++from pydantic import BaseModel
++from typing import Optional
++
++from core.pipeline import process_file
++from core.supabase_store import upload_bytes, make_signed_url
++
++APP_ENV = os.getenv("APP_ENV", "development")
++FRONTEND_ORIGIN = os.getenv("FRONTEND_ORIGIN", "*")
++
++app = FastAPI(title="TheAccountant API", version="0.2.0")
++
++app.add_middleware(
++    CORSMiddleware,
++    allow_origins=[FRONTEND_ORIGIN, "*"] if APP_ENV!="production" else [FRONTEND_ORIGIN],
++    allow_credentials=True,
++    allow_methods=["*"],
++    allow_headers=["*"],
++)
++
++class ProcessRequest(BaseModel):
++    file_id: str
++    client_id: str
++    period_start: Optional[str] = None
++    period_end: Optional[str] = None
++    bank_hint: Optional[str] = None
++
++UPLOAD_CACHE = {}
++
++@app.post("/api/v1/upload")
++async def upload(file: UploadFile = File(...)):
++    ext = os.path.splitext(file.filename)[1].lower()
++    if ext not in [".csv", ".pdf"]:
++        raise HTTPException(status_code=400, detail="Only CSV and PDF allowed")
++    data = await file.read()
++    if len(data) > int(os.getenv("MAX_FILE_MB","25"))*1024*1024:
++        raise HTTPException(status_code=400, detail="File too large for free tier")
++    file_id = str(uuid.uuid4())
++    UPLOAD_CACHE[file_id] = {"ext": ext, "data": data}
++    return {"file_id": file_id, "filename": file.filename}
++
++@app.post("/api/v1/process")
++async def process(req: ProcessRequest):
++    if req.file_id not in UPLOAD_CACHE:
++        raise HTTPException(status_code=404, detail="File not found")
++    blob = UPLOAD_CACHE.pop(req.file_id)
++    report = process_file(
++        file_bytes=blob["data"],
++        ext=blob["ext"],
++        file_id=req.file_id,
++        client_id=req.client_id,
++        period_start=req.period_start,
++        period_end=req.period_end,
++        bank_hint=req.bank_hint
++    )
++    files = {}
++    for name, bytes_data in report["artifacts"].items():
++        key = f"reports/{req.client_id}/{report['id']}/{name}"
++        upload_bytes(key, bytes_data)
++        files[name] = make_signed_url(key)
++    return {"status":"done", "report_pack_id": report["id"], "downloads": files}
+
+diff --git a/backend/core/pipeline.py b/backend/core/pipeline.py
+new file mode 100644
+index 0000000..b045873
+--- /dev/null
++++ b/backend/core/pipeline.py
+@@ -0,0 +1,31 @@
++import uuid, pandas as pd, io
++
++from ingestion.detect import detect_ext
++from ingestion.csv_parser import parse_csv_bytes
++from ingestion.pdf_extractor import extract_pdf_transactions
++from normalization.normalizer import normalize_df
++from classification.classifier import classify_transactions
++from coa.mapper import apply_coa
++from statements.builder import build_statements
++from kpi.engine import compute_kpis
++from narrative.writer import build_summary_text
++from export.exporter_mem import export_pack_bytes
++
++def process_file(file_bytes: bytes, ext: str, file_id: str, client_id: str, period_start: str|None, period_end: str|None, bank_hint: str|None=None):
++    if detect_ext(ext) == "csv":
++        df = parse_csv_bytes(file_bytes, bank_hint=bank_hint)
++    elif detect_ext(ext) == "pdf":
++        df = extract_pdf_transactions(io.BytesIO(file_bytes))
++    else:
++        raise ValueError("Unsupported file type")
++
++    df = normalize_df(df)
++    classified = classify_transactions(df, client_id=client_id)
++    ledger = apply_coa(classified)
++    statements = build_statements(ledger, period_start, period_end)
++    kpis = compute_kpis(statements, ledger)
++    summary_text = build_summary_text(statements, kpis)
++
++    report_pack_id = str(uuid.uuid4())
++    artifacts = export_pack_bytes(report_pack_id, df, statements, kpis, summary_text)
++    return {"id": report_pack_id, "artifacts": artifacts}
+
+diff --git a/backend/core/supabase_store.py b/backend/core/supabase_store.py
+new file mode 100644
+index 0000000..710eb1a
+--- /dev/null
++++ b/backend/core/supabase_store.py
+@@ -0,0 +1,22 @@
++import os
++from supabase import create_client, Client
++
++SUPABASE_URL = os.getenv("SUPABASE_URL","")
++SUPABASE_KEY = os.getenv("SUPABASE_SERVICE_ROLE_KEY","")
++
++def _client() -> Client:
++    if not SUPABASE_URL or not SUPABASE_KEY:
++        raise RuntimeError("Supabase not configured")
++    return create_client(SUPABASE_URL, SUPABASE_KEY)
++
++BUCKET = "reports"
++
++def upload_bytes(key: str, data: bytes):
++    s = _client().storage.from_(BUCKET)
++    s.upload(key, data, {"content-type":"application/octet-stream", "upsert": True})
++    return key
++
++def make_signed_url(key: str, expires_in: int = 60*60):
++    s = _client().storage.from_(BUCKET)
++    res = s.create_signed_url(key, expires_in)
++    return res.get("signedURL") or res.get("signedUrl")
+
+diff --git a/backend/ingestion/detect.py b/backend/ingestion/detect.py
+new file mode 100644
+index 0000000..79a74d1
+--- /dev/null
++++ b/backend/ingestion/detect.py
+@@ -0,0 +1,3 @@
++def detect_ext(ext: str) -> str:
++    e = ext.lower()
++    return 'csv' if e=='.csv' else 'pdf' if e=='.pdf' else 'unknown'
+
+diff --git a/backend/ingestion/csv_parser.py b/backend/ingestion/csv_parser.py
+new file mode 100644
+index 0000000..177e806
+--- /dev/null
++++ b/backend/ingestion/csv_parser.py
+@@ -0,0 +1,18 @@
++import pandas as pd
++def parse_csv_bytes(b: bytes, bank_hint: str|None=None) -> pd.DataFrame:
++    df = pd.read_csv(pd.io.common.BytesIO(b))
++    cols = {c.lower(): c for c in df.columns}
++    date_col = next((cols[k] for k in cols if "date" in k), None)
++    desc_col = next((cols[k] for k in cols if "descr" in k or "narr" in k or "details" in k), None)
++    amt_col  = next((cols[k] for k in cols if "amount" in k or "value" in k), None)
++    bal_col  = next((cols[k] for k in cols if "bal" in k), None)
++    if not (date_col and desc_col and amt_col):
++        raise ValueError("CSV must include date, description, amount columns")
++    out = pd.DataFrame({
++        "tx_date": pd.to_datetime(df[date_col], errors="coerce"),
++        "description": df[desc_col].astype(str),
++        "amount": pd.to_numeric(df[amt_col].astype(str).str.replace(',', ''), errors="coerce"),
++        "balance_after": pd.to_numeric(df[bal_col].astype(str).str.replace(',', ''), errors="coerce") if bal_col else None
++    }).dropna(subset=["tx_date","amount"])
++    out["direction"] = out["amount"].apply(lambda x: "credit" if x > 0 else "debit")
++    return out
+
+diff --git a/backend/ingestion/pdf_extractor.py b/backend/ingestion/pdf_extractor.py
+new file mode 100644
+index 0000000..fbfe79a
+--- /dev/null
++++ b/backend/ingestion/pdf_extractor.py
+@@ -0,0 +1,51 @@
++import pdfplumber, re, pandas as pd, fitz, pytesseract
++from PIL import Image
++from io import BytesIO
++
++DATE_PATTERNS = [r"\b\d{4}-\d{2}-\d{2}\b", r"\b\d{2}/\d{2}/\d{4}\b", r"\b\d{2}-\d{2}-\d{4}\b"]
++AMOUNT_PATTERN = r"[-+]?\d{1,3}(?:,\d{3})*(?:\.\d{2})?"
++
++def _parse_lines_to_df(lines):
++    rows = []
++    for ln in lines:
++        date_match = None
++        for p in DATE_PATTERNS:
++            m = re.search(p, ln)
++            if m: date_match = m.group(0); break
++        am = re.findall(AMOUNT_PATTERN, ln.replace(" ", ""))
++        amt = None
++        if am:
++            try: amt = float(am[-1].replace(",",""))
++            except: pass
++        if date_match and amt is not None:
++            desc = re.sub(AMOUNT_PATTERN, "", ln.replace(date_match, "")).strip()
++            tx_date = pd.to_datetime(date_match, dayfirst=True, errors="coerce")
++            if pd.notna(tx_date):
++                rows.append({"tx_date": tx_date, "description": desc, "amount": amt})
++    df = pd.DataFrame(rows)
++    if not df.empty:
++        df["direction"] = df["amount"].apply(lambda x: "credit" if x>0 else "debit")
++    return df
++
++def extract_pdf_transactions(file_obj) -> pd.DataFrame:
++    try:
++        lines = []
++        with pdfplumber.open(file_obj) as pdf:
++            for p in pdf.pages:
++                t = p.extract_text() or ""
++                for ln in t.splitlines():
++                    if ln.strip(): lines.append(ln.strip())
++        df = _parse_lines_to_df(lines)
++        if not df.empty: return df
++    except Exception:
++        pass
++    file_obj.seek(0)
++    doc = fitz.open(stream=file_obj.read(), filetype="pdf")
++    lines = []
++    for page in doc:
++        pix = page.get_pixmap(dpi=200)
++        img = Image.open(BytesIO(pix.tobytes("png")))
++        text = pytesseract.image_to_string(img)
++        for ln in text.splitlines():
++            if ln.strip(): lines.append(ln.strip())
++    return _parse_lines_to_df(lines)
+
+diff --git a/backend/normalization/normalizer.py b/backend/normalization/normalizer.py
+new file mode 100644
+index 0000000..3c6345c
+--- /dev/null
++++ b/backend/normalization/normalizer.py
+@@ -0,0 +1,7 @@
++import pandas as pd
++def normalize_df(df: pd.DataFrame) -> pd.DataFrame:
++    required = ["tx_date","description","amount","direction"]
++    for c in required:
++        if c not in df.columns: raise ValueError(f"Missing column: {c}")
++    df["description"] = df["description"].astype(str).str.replace(r"\s+"," ", regex=True).str.strip()
++    return df.sort_values("tx_date").reset_index(drop=True)
+
+diff --git a/backend/classification/rules.json b/backend/classification/rules.json
+new file mode 100644
+index 0000000..a44a708
+--- /dev/null
++++ b/backend/classification/rules.json
+@@ -0,0 +1,80 @@
++[
++  {
++    "pattern": "ESKOM|CITY OF|MUNICIPAL|WATER|ELECTRIC",
++    "category": "Utilities",
++    "subcategory": "Electricity/Water",
++    "confidence": 0.9
++  },
++  {
++    "pattern": "ENGEN|SHELL|TOTAL|BP|CALTEX",
++    "category": "Fuel",
++    "subcategory": "Fuel",
++    "confidence": 0.9
++  },
++  {
++    "pattern": "VODACOM|MTN|TELKOM|RAIN|AFRIHOST",
++    "category": "Telecom",
++    "subcategory": "Internet/Mobile",
++    "confidence": 0.9
++  },
++  {
++    "pattern": "PICK N PAY|CHECKERS|SHOPRITE|WOOLWORTHS|SPAR",
++    "category": "Retail",
++    "subcategory": "Groceries",
++    "confidence": 0.7
++  },
++  {
++    "pattern": "UBER|MR D|BOLT|TAKEALOT",
++    "category": "Delivery/Platforms",
++    "subcategory": "Services",
++    "confidence": 0.7
++  },
++  {
++    "pattern": "SERVICE FEE|BANK CHARGES|MONTHLY FEE",
++    "category": "Banking",
++    "subcategory": "Bank Fees",
++    "confidence": 0.95
++  },
++  {
++    "pattern": "INTEREST|OD FEE|OVERDRAFT",
++    "category": "Banking",
++    "subcategory": "Interest/Overdraft",
++    "confidence": 0.95
++  },
++  {
++    "pattern": "SARS|VAT|PAYE",
++    "category": "Tax",
++    "subcategory": "Tax Payments",
++    "confidence": 0.95
++  },
++  {
++    "pattern": "SALARY|PAYROLL|NET PAY|WAGES",
++    "category": "Payroll",
++    "subcategory": "Salaries",
++    "confidence": 0.95
++  },
++  {
++    "pattern": "RENT|LEASE|PROPERTY MANAGEMENT",
++    "category": "Premises",
++    "subcategory": "Rent",
++    "confidence": 0.9
++  },
++  {
++    "pattern": "OUTSURANCE|HOLLARD|SANTAM|DISCOVERY",
++    "category": "Insurance",
++    "subcategory": "Premiums",
++    "confidence": 0.9
++  },
++  {
++    "pattern": "LOAN REPAYMENT|CAPITAL REDUCTION|INSTALMENT",
++    "category": "Finance",
++    "subcategory": "Loan Payments",
++    "confidence": 0.9
++  },
++  {
++    "pattern": "EFT FROM|DEPOSIT|INCOMING|CREDIT",
++    "category": "Income",
++    "subcategory": "Sales/Receipts",
++    "confidence": 0.6
++  }
++]
+
+diff --git a/backend/classification/classifier.py b/backend/classification/classifier.py
+new file mode 100644
+index 0000000..10b359d
+--- /dev/null
++++ b/backend/classification/classifier.py
+@@ -0,0 +1,25 @@
++import re, json, os, pandas as pd
++from classification.overrides import load_overrides
++
++RULES_PATH = os.path.join("classification","rules.json")
++with open(RULES_PATH,"r") as f:
++    RULES = json.load(f)
++
++def classify_transactions(df: pd.DataFrame, client_id: str) -> pd.DataFrame:
++    over = load_overrides(client_id)
++    cats, subs, confs = [], [], []
++    for desc in df["description"].astype(str).tolist():
++        cat, sub, conf = "Uncategorized","Uncategorized",0.0
++        for patt, dest in over.items():
++            if re.search(patt, desc, flags=re.IGNORECASE):
++                cat, sub, conf = dest["category"], dest["subcategory"], 0.99
++                break
++        else:
++            for rule in RULES:
++                if re.search(rule["pattern"], desc, flags=re.IGNORECASE):
++                    cat, sub, conf = rule["category"], rule["subcategory"], rule["confidence"]
++                    break
++        cats.append(cat); subs.append(sub); confs.append(conf)
++    out = df.copy()
++    out["category"], out["subcategory"], out["classification_confidence"] = cats, subs, confs
++    return out
+
+diff --git a/backend/classification/overrides.py b/backend/classification/overrides.py
+new file mode 100644
+index 0000000..103feec
+--- /dev/null
++++ b/backend/classification/overrides.py
+@@ -0,0 +1,12 @@
++import os, json
++OVERRIDES_DIR = "storage/overrides"
++os.makedirs(OVERRIDES_DIR, exist_ok=True)
++
++def _file(client_id: str):
++    return os.path.join(OVERRIDES_DIR, f"{client_id}.json")
++
++def load_overrides(client_id: str):
++    p = _file(client_id)
++    if os.path.exists(p):
++        with open(p,"r",encoding="utf-8") as f: return json.load(f)
++    return {}
+
+diff --git a/backend/coa/coa_map.json b/backend/coa/coa_map.json
+new file mode 100644
+index 0000000..f8cad65
+--- /dev/null
++++ b/backend/coa/coa_map.json
+@@ -0,0 +1,84 @@
++{
++  "Income": {
++    "Sales/Receipts": {
++      "code": "4000",
++      "side": "C"
++    }
++  },
++  "Retail": {
++    "Groceries": {
++      "code": "5200",
++      "side": "D"
++    }
++  },
++  "Utilities": {
++    "Electricity/Water": {
++      "code": "5300",
++      "side": "D"
++    }
++  },
++  "Telecom": {
++    "Internet/Mobile": {
++      "code": "5310",
++      "side": "D"
++    }
++  },
++  "Fuel": {
++    "Fuel": {
++      "code": "5400",
++      "side": "D"
++    }
++  },
++  "Delivery/Platforms": {
++    "Services": {
++      "code": "5450",
++      "side": "D"
++    }
++  },
++  "Banking": {
++    "Bank Fees": {
++      "code": "5600",
++      "side": "D"
++    },
++    "Interest/Overdraft": {
++      "code": "5610",
++      "side": "D"
++    }
++  },
++  "Tax": {
++    "Tax Payments": {
++      "code": "5700",
++      "side": "D"
++    }
++  },
++  "Payroll": {
++    "Salaries": {
++      "code": "5800",
++      "side": "D"
++    }
++  },
++  "Premises": {
++    "Rent": {
++      "code": "5900",
++      "side": "D"
++    }
++  },
++  "Insurance": {
++    "Premiums": {
++      "code": "6000",
++      "side": "D"
++    }
++  },
++  "Finance": {
++    "Loan Payments": {
++      "code": "6100",
++      "side": "D"
++    }
++  },
++  "Uncategorized": {
++    "Uncategorized": {
++      "code": "9999",
++      "side": "D"
++    }
++  }
++}
+
+diff --git a/backend/coa/mapper.py b/backend/coa/mapper.py
+new file mode 100644
+index 0000000..9da6765
+--- /dev/null
++++ b/backend/coa/mapper.py
+@@ -0,0 +1,14 @@
++import json, os, pandas as pd
++COA_PATH = os.path.join("coa","coa_map.json")
++with open(COA_PATH,"r") as f:
++    COA = json.load(f)
++
++def apply_coa(df: pd.DataFrame) -> pd.DataFrame:
++    codes, sides = [], []
++    for _, row in df.iterrows():
++        m = COA.get(row.get("category","Uncategorized"),{}).get(row.get("subcategory","Uncategorized"))
++        if m is None: m = COA["Uncategorized"]["Uncategorized"]
++        codes.append(m["code"]); sides.append(m["side"])
++    out = df.copy()
++    out["account_code"], out["account_side"] = codes, sides
++    return out
+
+diff --git a/backend/statements/builder.py b/backend/statements/builder.py
+new file mode 100644
+index 0000000..e0c91c8
+--- /dev/null
++++ b/backend/statements/builder.py
+@@ -0,0 +1,34 @@
++import pandas as pd
++from typing import Optional, Dict, Any
++
++def build_statements(ledger: pd.DataFrame, period_start: Optional[str], period_end: Optional[str]) -> Dict[str, Any]:
++    df = ledger.copy()
++    if period_start: df = df[df["tx_date"] >= pd.to_datetime(period_start)]
++    if period_end:   df = df[df["tx_date"] <= pd.to_datetime(period_end)]
++    tb = df.groupby(["account_code","category","subcategory","account_side"], dropna=False)["amount"].sum().reset_index()
++
++    def is_amount(row):
++        amt = row["amount"]
++        return amt if row["category"]=="Income" else -abs(amt) if row["account_side"]=="D" else amt
++    is_df = df.copy()
++    is_df["is_amount"] = is_df.apply(is_amount, axis=1)
++    is_summary = is_df.groupby("category")["is_amount"].sum().reset_index()
++    revenue = is_df[is_df["category"]=="Income"]["is_amount"].sum()
++    expenses = is_df[is_df["category"]!="Income"]["is_amount"].sum()
++    net_profit = revenue + expenses
++
++    cash = df["amount"].sum()
++    bs = pd.DataFrame([
++        {"item":"Cash & Equivalents","amount":cash},
++        {"item":"Unreconciled/Other","amount":0.0}
++    ])
++    cfo = is_df[is_df["category"].isin(["Income","Retail","Utilities","Telecom","Fuel","Delivery/Platforms","Banking","Tax","Payroll","Premises","Insurance"]) ]["is_amount"].sum()
++    cf = pd.DataFrame([
++        {"section":"Operating","amount":cfo},
++        {"section":"Investing","amount":0.0},
++        {"section":"Financing","amount":0.0},
++        {"section":"Net Change in Cash","amount":cfo}
++    ])
++    return {"trial_balance":tb,"income_statement":is_summary.assign(net_profit=net_profit),
++            "balance_sheet":bs,"cash_flow":cf,"period_start":period_start,"period_end":period_end,
++            "revenue":float(revenue),"expenses":float(expenses),"net_profit":float(net_profit)}
+
+diff --git a/backend/kpi/engine.py b/backend/kpi/engine.py
+new file mode 100644
+index 0000000..f7470e6
+--- /dev/null
++++ b/backend/kpi/engine.py
+@@ -0,0 +1,48 @@
++import pandas as pd
++from typing import Dict, Any
++
++def compute_kpis(statements: Dict[str, Any], ledger: pd.DataFrame) -> Dict[str, Any]:
++    revenue = statements["revenue"]; expenses = statements["expenses"]; net_profit = statements["net_profit"]
++    ledger = ledger.copy(); ledger["date"] = pd.to_datetime(ledger["tx_date"], errors="coerce")
++    daily = ledger.groupby(ledger["date"].dt.date)["amount"].sum().reset_index(name="net_flow")
++    avg_outflows = ledger[ledger["direction"]=="debit"]["amount"].abs().mean() or 0.0
++    days_cash = float(ledger["amount"].sum() / avg_outflows) if avg_outflows>0 else None
++
++    overdraft_days = 0
++    if "balance_after" in ledger.columns and ledger["balance_after"].notna().any():
++        bal = ledger[["date","balance_after"]].dropna()
++        overdraft_days = int((bal["balance_after"] < 0).sum())
++
++    return {
++        "revenue": float(revenue),
++        "expenses": float(expenses),
++        "net_profit": float(net_profit),
++        "avg_daily_net_flow": float(daily["net_flow"].mean()) if len(daily)>0 else 0.0,
++        "days_cash_proxy": days_cash,
++        "overdraft_days": overdraft_days,
++        "top_expense_categories": _top_expense_categories(ledger),
++        "flags": _compute_flags(ledger)
++    }
++
++def _top_expense_categories(ledger: pd.DataFrame, n:int=5):
++    exp = ledger[ledger["category"]!="Income"]
++    g = exp.groupby("category")["amount"].sum().abs().sort_values(ascending=False).head(n)
++    return [{"category":k, "total":float(v)} for k,v in g.items()]
++
++def _compute_flags(ledger: pd.DataFrame):
++    flags = []
++    exp = ledger[ledger["category"]!="Income"].copy()
++    if len(exp)>0:
++        med = exp.groupby("category")["amount"].apply(lambda s: s.abs().median()).to_dict()
++        for _, row in exp.iterrows():
++            m = med.get(row["category"], 0.0)
++            if m and abs(row["amount"]) > 3*m and abs(row["amount"]) > 1000:
++                flags.append({"type":"expense_spike","date":str(row["tx_date"]),"amount":float(row["amount"]),
++                              "category":row["category"],"description":row["description"]})
++    ledger["weekday"] = pd.to_datetime(ledger["tx_date"], errors="coerce").dt.weekday
++    wknd = ledger[ledger["weekday"].isin([5,6])]
++    for _, row in wknd.iterrows():
++        if abs(row["amount"]) > 5000:
++            flags.append({"type":"weekend_high_value","date":str(row["tx_date"]),"amount":float(row["amount"]),
++                          "category":row.get("category",""),"description":row.get("description","")})
++    return flags
+
+diff --git a/backend/narrative/writer.py b/backend/narrative/writer.py
+new file mode 100644
+index 0000000..d70f6c1
+--- /dev/null
++++ b/backend/narrative/writer.py
+@@ -0,0 +1,47 @@
++from jinja2 import Template
++SUMMARY_TEMPLATE = Template("""
++Executive Financial Summary (AI Draft)
++Period: {{ period_start or 'N/A' }} to {{ period_end or 'N/A' }}
++
++Snapshot:
++- Revenue: R{{ '{:,.2f}'.format(revenue) }}
++- Expenses: R{{ '{:,.2f}'.format(expenses) }}
++- Net Profit: R{{ '{:,.2f}'.format(net_profit) }}
++- Avg Daily Net Flow: R{{ '{:,.2f}'.format(avg_daily_net_flow) }}
++- Overdraft Days (proxy): {{ overdraft_days }}
++
++Highlights:
++{% if top_expenses %}
++- Top expense categories: {% for e in top_expenses %}{{e.category}} (R{{ '{:,.0f}'.format(e.total) }}){% if not loop.last %}, {% endif %}{% endfor %}
++{% else %}- Expense mix stable with no dominant outliers.
++{% endif %}
++
++Risks & Anomalies:
++{% if flags %}
++{% for f in flags %}- {{ f.type.replace('_',' ').title() }} on {{ f.date }}: R{{ '{:,.2f}'.format(f.amount) }} ({{ f.category }}) - {{ f.description }}
++{% endfor %}
++{% else %}- No material anomalies detected in the period.
++{% endif %}
++
++Recommendations:
++- Maintain documentation for high-value transactions flagged above.
++- Consider negotiating supplier terms to reduce expense spikes.
++- Monitor overdraft usage and interest costs if applicable.
++- Validate categorisation for any 'Uncategorized' items and update rules.
++
++Notes:
++This summary is system-generated and should be reviewed by a qualified accountant before sign-off.
++""")
++
++def build_summary_text(statements, kpis):
++    return SUMMARY_TEMPLATE.render(
++        period_start=statements.get("period_start"),
++        period_end=statements.get("period_end"),
++        revenue=statements.get("revenue",0.0),
++        expenses=statements.get("expenses",0.0),
++        net_profit=statements.get("net_profit",0.0),
++        avg_daily_net_flow=kpis.get("avg_daily_net_flow",0.0),
++        overdraft_days=kpis.get("overdraft_days",0),
++        top_expenses=[type("E",(),e) for e in kpis.get("top_expense_categories",[])],
++        flags=kpis.get("flags",[])
++    ).strip()
+
+diff --git a/backend/export/exporter_mem.py b/backend/export/exporter_mem.py
+new file mode 100644
+index 0000000..61333dc
+--- /dev/null
++++ b/backend/export/exporter_mem.py
+@@ -0,0 +1,49 @@
++import pandas as pd
++from reportlab.lib.pagesizes import A4
++from reportlab.pdfgen import canvas
++from reportlab.lib.units import cm
++from io import BytesIO
++
++def export_pack_bytes(report_pack_id: str, raw_df: pd.DataFrame, statements, kpis, summary_text: str):
++    artifacts = {}
++
++    buf_csv = BytesIO()
++    raw_df.to_csv(buf_csv, index=False)
++    artifacts["raw.csv"] = buf_csv.getvalue()
++
++    buf_xlsx = BytesIO()
++    with pd.ExcelWriter(buf_xlsx, engine="xlsxwriter") as writer:
++        raw_df.to_excel(writer, sheet_name="Raw", index=False)
++        statements["trial_balance"].to_excel(writer, sheet_name="TrialBalance", index=False)
++        statements["income_statement"].to_excel(writer, sheet_name="IncomeStatement", index=False)
++        statements["balance_sheet"].to_excel(writer, sheet_name="BalanceSheet", index=False)
++        statements["cash_flow"].to_excel(writer, sheet_name="CashFlow", index=False)
++        pd.DataFrame([kpis]).to_excel(writer, sheet_name="KPIs", index=False)
++    artifacts["financials.xlsx"] = buf_xlsx.getvalue()
++
++    buf_pdf = BytesIO()
++    _write_pdf_summary(buf_pdf, summary_text)
++    artifacts["executive_summary.pdf"] = buf_pdf.getvalue()
++
++    return artifacts
++
++def _write_pdf_summary(buf, text: str):
++    c = canvas.Canvas(buf, pagesize=A4)
++    width, height = A4; margin = 2*cm; x = margin; y = height - margin
++    c.setFont("Helvetica-Bold", 14); c.drawString(x, y, "Executive Financial Summary (AI Draft)"); y -= 14*1.2
++    c.setFont("Helvetica", 10)
++    for line in text.splitlines():
++        for chunk in _wrap(line, 100):
++            if y < margin: c.showPage(); y = height - margin; c.setFont("Helvetica", 10)
++            c.drawString(x, y, chunk); y -= 12
++    c.showPage(); c.save()
++    buf.seek(0)
++
++def _wrap(s: str, width: int):
++    words = s.split(); line = []; length = 0
++    for w in words:
++        if length + len(w) + 1 > width:
++            yield " ".join(line); line = [w]; length = len(w) + 1
++        else:
++            line.append(w); length += len(w) + 1
++    if line: yield " ".join(line)
+
+diff --git a/frontend/package.json b/frontend/package.json
+new file mode 100644
+index 0000000..ea361d9
+--- /dev/null
++++ b/frontend/package.json
+@@ -0,0 +1,6 @@
++{
++  "name": "theaccountant-frontend",
++  "private": true,
++  "scripts": { "dev": "next dev", "build": "next build", "start": "next start" },
++  "dependencies": { "@supabase/supabase-js": "2.45.0", "next": "14.2.5", "react": "18.2.0", "react-dom": "18.2.0" }
++}
+
+diff --git a/frontend/next.config.js b/frontend/next.config.js
+new file mode 100644
+index 0000000..b710bf7
+--- /dev/null
++++ b/frontend/next.config.js
+@@ -0,0 +1,1 @@
++module.exports = { reactStrictMode: true };
+
+diff --git a/frontend/.env.example b/frontend/.env.example
+new file mode 100644
+index 0000000..41d901c
+--- /dev/null
++++ b/frontend/.env.example
+@@ -0,0 +1,3 @@
++NEXT_PUBLIC_SUPABASE_URL=
++NEXT_PUBLIC_SUPABASE_ANON_KEY=
++NEXT_PUBLIC_BACKEND_URL=
+
+diff --git a/frontend/pages/index.js b/frontend/pages/index.js
+new file mode 100644
+index 0000000..b872778
+--- /dev/null
++++ b/frontend/pages/index.js
+@@ -0,0 +1,40 @@
++import { useState } from 'react'
++
++export default function Home() {
++  const [file, setFile] = useState(null)
++  const [status, setStatus] = useState('Idle')
++  const [links, setLinks] = useState(null)
++
++  const go = async () => {
++    if (!file) return alert('Choose a CSV or PDF')
++    setStatus('Uploading...')
++    const fd = new FormData()
++    fd.append('file', file)
++    const u = await fetch(process.env.NEXT_PUBLIC_BACKEND_URL + '/api/v1/upload', { method:'POST', body: fd })
++    if (!u.ok) return setStatus('Upload failed')
++    const { file_id } = await u.json()
++    setStatus('Processing...')
++    const p = await fetch(process.env.NEXT_PUBLIC_BACKEND_URL + '/api/v1/process', {
++      method:'POST', headers:{'Content-Type':'application/json'},
++      body: JSON.stringify({ file_id, client_id:'DEMO' })
++    })
++    if (!p.ok) return setStatus('Processing failed')
++    const { downloads } = await p.json()
++    setLinks(downloads); setStatus('Done')
++  }
++
++  return (
++    <main style={{maxWidth:780, margin:'40px auto', fontFamily:'Inter, Arial'}}>
++      <h1>The Accountant</h1>
++      <p>Upload your bank statement (CSV/PDF) and download Excel + PDF financials.</p>
++      <input type='file' accept='.csv,.pdf' onChange={e=>setFile(e.target.files?.[0])} />
++      <button onClick={go} style={{marginLeft:12}}>Generate</button>
++      <p>Status: {status}</p>
++      {links && <ul>
++        <li><a href={links['raw.csv']} target='_blank'>raw.csv</a></li>
++        <li><a href={links['financials.xlsx']} target='_blank'>financials.xlsx</a></li>
++        <li><a href={links['executive_summary.pdf']} target='_blank'>executive_summary.pdf</a></li>
++      </ul>}
++    </main>
++  )
++}
+
+diff --git a/frontend/vercel.json b/frontend/vercel.json
+new file mode 100644
+index 0000000..394eaa0
+--- /dev/null
++++ b/frontend/vercel.json
+@@ -0,0 +1,1 @@
++{ "version": 2, "builds": [{ "src": "package.json", "use": "@vercel/next" }] }
+
