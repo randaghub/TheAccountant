@@ -1,0 +1,13 @@
+create schema if not exists app;
+create table if not exists app.organizations (id uuid primary key default gen_random_uuid(), name text not null, created_at timestamptz default now());
+create table if not exists app.user_profiles (user_id uuid primary key, email text, created_at timestamptz default now());
+create table if not exists app.memberships (org_id uuid references app.organizations(id) on delete cascade, user_id uuid references app.user_profiles(user_id) on delete cascade, role text default 'member', primary key(org_id, user_id));
+create table if not exists app.plans (id text primary key, name text not null, monthly_reports_limit int not null, price_cents int not null default 0);
+create table if not exists app.subscriptions (org_id uuid references app.organizations(id) on delete cascade primary key, plan_id text references app.plans(id) not null, status text not null default 'active', current_period_start date default date_trunc('month', now()), current_period_end date default (date_trunc('month', now()) + interval '1 month' - interval '1 day'));
+create table if not exists app.usage_reports (org_id uuid references app.organizations(id) on delete cascade, period_start date not null, period_end date not null, reports_generated int not null default 0, primary key(org_id, period_start));
+insert into app.plans (id, name, monthly_reports_limit, price_cents) values ('free','Free',20,0),('pro','Pro',200,4900),('enterprise','Enterprise',1000000,0) on conflict (id) do nothing;
+alter table app.organizations enable row level security;
+alter table app.user_profiles enable row level security;
+alter table app.memberships enable row level security;
+alter table app.subscriptions enable row level security;
+alter table app.usage_reports enable row level security;
